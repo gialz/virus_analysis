@@ -1,0 +1,287 @@
+---
+title: "virtus_covid"
+author: "Ginna"
+date: "2025-08-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggpubr)
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(corrplot)
+library(ggcorrplot)
+```
+
+```{r function for reading in metadata and results}
+
+
+# Read the metadata file
+covid_metadata <- read_csv("/Users/ginna/Desktop/internship/practice/virtus2/covid_metadata_cleaned.csv")
+
+# Define the function to read and tag each file
+customized_read_tsv <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    mutate(fileName = basename(file),
+    Accession = str_remove(fileName, "_VIRTUS.output.tsv$"))
+}
+
+# Apply the function to all .tsv files and process
+virtus_covid_data <- list.files(path = "/Users/ginna/Desktop/internship/practice/virtus2/virtus_covid_final",
+           full.names = TRUE,
+           pattern = "\\.tsv$") %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(Accession, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq, rate_hit)
+
+virtus_covid_data <- virtus_covid_data %>%
+  mutate(
+    virus = if_else(
+      str_detect(virus, "\\|"),
+      str_extract(virus, "(?<=\\|)[^|]+$"),
+      virus
+    ),
+    virus = str_replace_all(virus, "_", " "),
+    virus = str_remove(virus, ", complete genome$"),
+    virus = str_remove(virus, ", genomic RNA, isolate Ib An 5550"),
+    virus = str_remove(virus, "NC [^ ]*?\\.(1|2)"),
+    virus = str_remove(virus, "^\\.([12])\\s*"),
+    virus = str_trim(virus)
+  )
+
+unique(virtus_covid_data$Accession)[1:5]
+unique(covid_metadata$Accession)[1:5]
+
+```
+
+```{r join meta data and virtus data}
+virtus_covid_data <- virtus_covid_data %>%
+  mutate(Accession = as.character(str_trim(Accession)))
+
+covid_metadata <- covid_metadata %>%
+  mutate(Accession = as.character(str_trim(Accession)))
+
+
+
+all_covid_data <- left_join(virtus_covid_data,covid_metadata, by = 'Accession')
+
+colnames(all_covid_data)
+
+```
+
+```{r boxplot for virus in virtus_data}
+virtus_covid_data <- virtus_covid_data %>%
+  mutate(virus = fct_reorder(virus, numreads, .fun=median))
+
+count_data <- virtus_covid_data %>%
+  group_by(virus) %>%
+  summarise(n = n_distinct(Accession)) %>%
+  mutate(virus = factor(virus, levels = levels(virtus_covid_data$virus)))
+
+ggplot(virtus_covid_data, aes(x = virus, y = numreads)) +
+  geom_boxplot() +
+  coord_flip() +
+  geom_text(
+    data = count_data,
+    aes(x = virus, y = max(virtus_covid_data$numreads, na.rm = TRUE) * 1.05, label = paste("n =", n)),
+    inherit.aes = FALSE,
+    size = 2.5,
+    hjust = -0.1) +
+  labs(title = "Read Counts per Virus in VIRTUS Data",
+      x = "Virus",
+      y = "Number of Reads") +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+```{r Read Counts per Virus in virtus_data by group}
+ggplot(
+  all_covid_data %>% filter(numreads >= 2),
+  aes(x = virus, y = numreads, fill = group)
+) +
+  geom_boxplot() +
+  facet_wrap(~group) +
+  labs(
+    title = "Read Counts per Virus in ALL Data by Genotype",
+    x = "Virus",
+    y = "Number of Reads"
+  ) +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r read in the rimod data}
+
+# Define the function to read and tag each file
+customized_read_tsv <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    mutate(fileName = basename(file),
+    sample = str_remove(fileName, "_VIRTUS.output.tsv$"))
+}
+
+# Apply the function to all .tsv files and process
+virtus_rimod_data <- list.files(path = "/Users/ginna/Desktop/internship/practice/virtus2/virtus_rimod_final",
+           full.names = TRUE,
+           pattern = "\\.tsv$") %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(sample, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq, rate_hit)
+
+virtus_rimod_data <- virtus_rimod_data %>%
+  mutate(
+    virus = if_else(
+      str_detect(virus, "\\|"),
+      str_extract(virus, "(?<=\\|)[^|]+$"),
+      virus
+    ),
+    virus = str_replace_all(virus, "_", " "),
+    virus = str_remove(virus, ", complete genome$"),
+    virus = str_remove(virus, ", genomic RNA, isolate Ib An 5550"),
+    virus = str_remove(virus, "NC [^ ]*?\\.(1|2)"),
+    virus = str_remove(virus, "^\\.([12])\\s*"),
+    virus = str_trim(virus)
+  )
+
+rimod_metadata <- read.csv("/Users/ginna/Desktop/internship/practice/virtus2/new_rimod_meta_data_4.csv")
+
+all_rimod_data <- left_join(virtus_rimod_data,rimod_metadata)
+```
+
+```{r barchart of HPV in brain}
+# Label the study in each dataset
+all_rimod_data <- all_rimod_data %>%
+  mutate(study = "RiMod")
+
+all_covid_data <- all_covid_data %>%
+  mutate(study = "COVID")
+
+
+combined_data <- bind_rows(all_rimod_data, all_covid_data)
+
+hpv_samples <- combined_data %>%
+  filter(str_detect(virus, regex("papillomavirus", ignore_case = TRUE)), numreads >= 20) %>%
+  distinct(sample, study) %>%
+  mutate(hpv_detected = 1)
+
+all_samples <- combined_data %>%
+  distinct(sample, study)
+
+hpv_fraction <- left_join(all_samples, hpv_samples, by = c("sample", "study")) %>%
+  mutate(hpv_detected = ifelse(is.na(hpv_detected), 0, hpv_detected)) %>%
+  group_by(study) %>%
+  summarise(
+    total_samples = n(),
+    hpv_positive = sum(hpv_detected),
+    fraction = hpv_positive / total_samples
+  )
+
+library(ggplot2)
+
+ggplot(hpv_fraction, aes(x = study, y = fraction, fill = study)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = scales::percent(fraction, accuracy = 1)),
+          vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1.1)) +
+  labs(
+    title = "Fraction of Brain Samples with HPV Detection",
+    x = "Study",
+    y = "Fraction of Samples with HPV"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+
+```
+
+```{r virus counts across both datasets}
+# Get distinct virus-sample combinations
+virus_summary <- combined_data %>%
+  filter(!is.na(virus)) %>%
+  distinct(study, sample, virus)
+
+# Count how many samples in each study have each virus
+virus_counts <- virus_summary %>%
+  group_by(study, virus) %>%
+  summarise(n_samples = n(), .groups = "drop")
+
+# Pivot to compare side by side
+virus_compare <- virus_counts %>%
+  pivot_wider(names_from = study, values_from = n_samples, values_fill = 0)
+
+# Optional: filter viruses that appear in both studies
+virus_consistent <- virus_compare %>%
+  filter(COVID > 0 & RiMod > 0)
+
+```
+
+```{r read in pathonoia covid data}
+library(tidyverse)
+
+# Load the data
+df <- read_csv("~/Desktop/internship/practice/virtus2/mapped_virus_contamination.csv")
+
+# Convert to long format with Accession + species_name down the left
+df_long <- df %>%
+  select(species_name, starts_with("SRR")) %>%
+  pivot_longer(
+    cols = -species_name,
+    names_to = "Accession",
+    values_to = "read_count"
+  )
+
+# View result
+glimpse(df_long)
+
+all_covid_data <- left_join(df_long,covid_metadata, by = 'Accession')
+
+colnames(all_covid_data)
+
+all_covid_data <- all_covid_data %>%
+  mutate(virus = fct_reorder(species_name, read_count, .fun=median))
+
+count_data <- df_long %>%
+  filter(read_count >= 1000) %>%  # set your actual threshold here
+  group_by(species_name) %>%
+  summarise(n = n_distinct(Accession))
+
+read_threshold <- 1000
+
+df_long <- df_long %>%
+  filter(read_count >= read_threshold)
+
+
+ggplot(df_long, aes(x = species_name, y = read_count)) +
+  geom_boxplot(outlier.size = 0.5) +
+  coord_flip() +
+  geom_text(
+    data = count_data %>% filter(species_name %in% df_long$species_name),
+    aes(x = species_name, y = max(df_long$read_count, na.rm = TRUE) * 1.05, label = paste("n =", n)),
+    inherit.aes = FALSE,
+    size = 2.5,
+    hjust = -0.1
+  ) +
+  labs(
+    title = "Read Counts per Virus in COVID Pathonoia Data",
+    x = "Virus (species_name)",
+    y = "Read Count"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+
+
+```
+

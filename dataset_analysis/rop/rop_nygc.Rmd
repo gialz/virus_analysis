@@ -1,0 +1,353 @@
+---
+title: "rop_nygc"
+author: "Ginna"
+date: "2025-08-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+```
+
+```{r read in viral tables}
+library(tidyverse)
+
+# Function to read one TSV and extract sample name
+customized_read_tsv <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    mutate(
+      fileName = basename(file),
+      sample_name = str_remove(fileName, ".txt$")
+    ) %>%
+    rename(virus = `#rname`)   # rename column
+}
+
+# Get list of files (only non-empty)
+virtus_files <- list.files(
+  path = "/Users/ginna/Desktop/nygc_coverage/coverage_virtus/",
+  full.names = TRUE,
+  pattern = "\\.txt$"
+)
+virtus_files <- virtus_files[file.size(virtus_files) > 0]
+
+viral_files <- list.files(
+  path = "/Users/ginna/Desktop/nygc_coverage/coverage_viral/",
+  full.names = TRUE,
+  pattern = "\\.txt$"
+)
+viral_files <- viral_files[file.size(viral_files) > 0]
+
+# vipr_files <- list.files(
+#   path = "/Users/ginna/Desktop/nygc_coverage/coverage_vipr/",
+#   full.names = TRUE,
+#   pattern = "\\.txt$"
+# )
+# vipr_files <- vipr_files[file.size(vipr_files) > 0]
+
+# Read, filter, combine separately
+virtus_data <- virtus_files %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq)
+
+viral_data <- viral_files %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq)
+
+# vipr_data <- vipr_files %>%
+#   lapply(customized_read_tsv) %>%
+#   bind_rows() %>%
+#   select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+#          meandepth, meanbaseq, meanmapq)
+
+```
+
+```{r count data for all 3 virus counts, echo=FALSE}
+
+count_data_virtus <- virtus_data %>%
+  filter(numreads > 0) %>%
+  group_by(virus) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "virtus")
+
+count_data_viral <- viral_data %>%
+  filter(numreads > 0) %>%
+  group_by(virus) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "viral")
+
+count_data_vipr <- vipr_data %>%
+  filter(numreads > 0) %>%
+  group_by(virus) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "vipr")
+```
+
+```{r join viral with virtus names}
+# 2) Virtus already has readable names -> use as canonical
+virtus_named <- virtus_data %>%
+  mutate(canon_name = virus)
+
+# 3) Map viral accessions -> same canonical names as virtus via lookup
+virus_lookup <- read_tsv("~/Desktop/library_report.tsv", show_col_types = FALSE) %>%
+  distinct(reference, virus)          # rename pretty name -> virtus_name
+
+# Viral: map to virtus_name when available, else fall back to its own reference (viral's 'virus')
+viral_named <- viral_data %>%
+  left_join(virus_lookup, by = c("virus" = "reference")) %>%
+  mutate(
+    virus       = as.character(virus),     # fallback to viral's own reference
+  )
+
+count_data_viral <- viral_named %>%
+  filter(numreads > 0) %>%
+  group_by(virus.y) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "viral")
+
+```
+
+```{r plot viral against virtus}
+virtus_nr <- virtus_named %>%
+  group_by(sample_name, canon_name) %>%
+  summarise(numreads_virtus = sum(numreads, na.rm = TRUE), .groups = "drop")
+
+viral_nr <- viral_named %>%
+  group_by(virus, virus.y, sample_name) %>%
+  rename(canon_name = virus.y) %>%
+  summarise(numreads_viral = sum(numreads, na.rm = TRUE), .groups = "drop")
+
+viral_totals <- viral_nr %>%
+  group_by(canon_name, sample_name, numreads_viral) %>%
+  summarise(total_numreads = sum(numreads_viral, na.rm = TRUE), .groups = "drop") %>%
+  filter(total_numreads > 8000) %>%
+  arrange(desc(total_numreads))
+
+ggplot(viral_totals, aes(x = reorder(canon_name, total_numreads), y = total_numreads)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Total numreads per virus (viral) in NYGC data",
+    x = "Virus",
+    y = "Total numreads"
+  ) +
+  theme_minimal()
+
+virtus_totals <- virtus_nr %>%
+  group_by(canon_name) %>%
+  summarise(total_numreads = sum(numreads_virtus, na.rm = TRUE), .groups = "drop") %>%
+  filter(total_numreads > 0) %>%               # remove this line if you want all
+  arrange(desc(total_numreads)) %>%
+  mutate(label = str_wrap(canon_name, width = 40))  # wrap long labels
+
+# 2) Plot with smaller text
+ggplot(virtus_totals, aes(x = reorder(label, total_numreads), y = total_numreads)) +
+  geom_col() +
+  coord_flip() +  # nicer big numbers
+  labs(
+    title = "Total numreads per virus (virtus) in NYGC data",
+    x = "Virus",
+    y = "Total numreads"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 7),
+    plot.title  = element_text(size = 12, face = "bold")
+  )
+
+
+
+```
+
+```{r}
+
+vipr_totals <- vipr_data %>%
+  group_by(virus) %>%
+  summarise(total_numreads = sum(numreads, na.rm = TRUE), .groups = "drop") %>%
+  filter(total_numreads > 1000000) %>%               # remove this line if you want all
+  arrange(desc(total_numreads)) %>%
+  mutate(label = str_wrap(virus, width = 40))  # wrap long labels
+
+
+ggplot(vipr_totals, aes(x = reorder(label, total_numreads), y = total_numreads)) +
+  geom_col() +
+  coord_flip() +  # nicer big numbers
+  labs(
+    title = "Total numreads per virus (vipr) in NYGC data",
+    x = "Virus",
+    y = "Total numreads"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 7),
+    plot.title  = element_text(size = 12, face = "bold")
+  )
+
+```
+
+```{r join metadata}
+
+metadata <- read.csv("~/Desktop/internship/practice/virtus2/filtered_nygc.csv")
+
+# 1) Per sample × virus counts (clean the suffix)
+viral_long <- viral_named %>%
+  transmute(sample_name = str_remove(sample_name, "_viral\\.coverage$"),
+            virus, numreads) %>%
+  group_by(sample_name, virus) %>%
+  summarise(numreads = sum(numreads, na.rm = TRUE), .groups = "drop")
+
+
+# 2) Keep viruses you care about (e.g., > 50k total)
+keep <- viral_long %>%
+  group_by(virus) %>%
+  summarise(total = sum(numreads), .groups = "drop") %>%
+  filter(total > 100000) %>%
+  pull(virus)
+
+# Add implicit zeros + join metadata
+plot_df <- viral_long %>%
+  filter(virus %in% keep) %>%
+  complete(sample_name, virus, fill = list(numreads = 0)) %>%
+  left_join(metadata %>% select(sample_name = sample_id_rna, tdp_proteinopathy),
+            by = "sample_name")
+
+# match names
+virus_lookup <- read_tsv("~/Desktop/library_report.tsv", show_col_types = FALSE) %>%
+  distinct(reference, name = virus)
+
+#left join names
+plot_df <- plot_df %>%
+  left_join(virus_lookup, by = c("virus" = "reference")) %>%
+  mutate(virus = if_else(!is.na(name), name, virus))
+
+#pick top 15 viruses
+topN <- 15
+top_viruses <- plot_df %>%
+  group_by(virus) %>%
+  summarise(total = sum(numreads), .groups = "drop") %>%
+  slice_max(total, n = topN) %>%
+  pull(virus)
+
+#pick only viruses in top virus
+plot_df <- plot_df %>% filter(virus %in% top_viruses)
+
+plot_df <- plot_df %>%
+  mutate(disease_num = as.integer(factor(tdp_proteinopathy)) - 1L)
+
+# Spearman correlation
+res <- cor.test(plot_df$numreads, plot_df$disease_num, method = "spearman")
+res
+
+rho <- round(res$estimate, 2)
+pval <- signif(res$p.value, 3)
+
+#plot correlation 
+ggplot(plot_df, aes(x = tdp_proteinopathy, y = numreads, fill = tdp_proteinopathy)) +
+  geom_boxplot() +
+  annotate("text", x = 1.5, y = max(plot_df$numreads) * 1.05,
+           label = paste0("Spearman ρ = ", rho, ", p = ", pval)) +
+  labs(title = "Reads per Virus by Disease in Viral Database for NYGC data",
+       x = "Disease", y = "Reads") +
+  theme_minimal()
+
+#plot total viral burden
+total_burden <- plot_df %>%
+  group_by(sample_name, tdp_proteinopathy) %>%
+  summarise(total_reads = sum(numreads), .groups = "drop")
+
+total_burden <- total_burden %>%
+  mutate(disease_num = as.integer(factor(tdp_proteinopathy)) - 1L)
+
+res <- cor.test(total_burden$total_reads, total_burden$disease_num, method = "spearman")
+
+ggplot(total_burden, aes(x = tdp_proteinopathy, y = total_reads, fill = tdp_proteinopathy)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4) +
+  scale_y_log10() +
+  annotate("text", x = 1.5, y = max(total_burden$total_reads),
+           label = paste0("Spearman ρ = ", round(res$estimate, 2),
+                          ", p = ", signif(res$p.value, 3)),
+           hjust = 0.5) +
+  labs(title = "Total Viral Burden by Disease",
+       x = "Disease", y = "Total Reads (log10)") +
+  theme_minimal()
+
+#account for implicit zeroes
+#add statistical test for difference in mean
+
+mean_burden_2 <- total_burden %>%
+  group_by(tdp_proteinopathy) %>%
+  summarise(mean_reads = mean(total_reads), .groups = "drop")
+
+mean_burden_2
+
+res <- wilcox.test(numreads ~ tdp_proteinopathy, data = plot_df)
+res
+
+# Extract p-value
+pval <- signif(res$p.value, 3)
+
+# Plot with annotation
+ggplot(plot_df, aes(x = tdp_proteinopathy, y = numreads, fill = tdp_proteinopathy)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4) +
+  annotate("text",
+           x = 1.5,
+           y = max(plot_df$numreads) * 1.05,
+           label = paste0("Wilcoxon p = ", pval)) +
+  labs(
+    title = "Reads per Virus by Disease",
+    x = "Disease",
+    y = "Reads"
+  ) +
+  theme_minimal()
+
+res2 <- wilcox.test(mean_reads ~ tdp_proteinopathy, data = mean_burden_2)
+res2
+
+# Extract p-value
+pval <- signif(res$p.value, 3)
+
+# Plot with annotation
+ggplot(plot_df, aes(x = tdp_proteinopathy, y = numreads, fill = tdp_proteinopathy)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4) +
+  annotate("text",
+           x = 1.5,
+           y = max(plot_df$numreads) * 1.05, 
+           label = paste0("Wilcoxon p = ", pval)) +
+  labs(
+    title = "Reads per Virus by Disease",
+    x = "Disease",
+    y = "Reads"
+  ) +
+  theme_minimal()
+
+res_burden <- wilcox.test(mean_reads ~ tdp_proteinopathy, data = mean_burden_2)
+pval_burden <- signif(res_burden$p.value, 3)
+
+```
+

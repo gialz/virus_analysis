@@ -1,0 +1,215 @@
+---
+title: "rop_nygc"
+author: "Ginna"
+date: "2025-08-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+```
+
+```{r read in viral tables}
+library(tidyverse)
+
+# Function to read one TSV and extract sample name
+customized_read_tsv <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    mutate(
+      fileName = basename(file),
+      sample_name = str_remove(fileName, ".txt$")
+    ) %>%
+    rename(virus = `#rname`)   # rename column
+}
+
+# Get list of files (only non-empty)
+virtus_files <- list.files(
+  path = "/Users/ginna/Desktop/rimod_coverage/coverage_virtus/",
+  full.names = TRUE,
+  pattern = "\\.txt$"
+)
+virtus_files <- virtus_files[file.size(virtus_files) > 0]
+
+viral_files <- list.files(
+  path = "/Users/ginna/Desktop/rimod_coverage/coverage_viral/",
+  full.names = TRUE,
+  pattern = "\\.txt$"
+)
+viral_files <- viral_files[file.size(viral_files) > 0]
+
+vipr_files <- list.files(
+  path = "/Users/ginna/Desktop/rimod_coverage/coverage_vipr/",
+  full.names = TRUE,
+  pattern = "\\.txt$"
+)
+vipr_files <- vipr_files[file.size(vipr_files) > 0]
+
+# Read, filter, combine separately
+virtus_data <- virtus_files %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq)
+
+viral_data <- viral_files %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq)
+
+vipr_data <- vipr_files %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq)
+
+```
+
+```{r count data for all 3 virus counts, echo=FALSE}
+
+count_data_virtus <- virtus_data %>%
+  filter(numreads > 0) %>%
+  group_by(virus) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "virtus")
+
+count_data_viral <- viral_data %>%
+  filter(numreads > 0) %>%
+  group_by(virus) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "viral")
+
+count_data_vipr <- vipr_data %>%
+  filter(numreads > 0) %>%
+  group_by(virus) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "vipr")
+```
+
+```{r join viral with virtus names}
+# 2) Virtus already has readable names -> use as canonical
+virtus_named <- virtus_data %>%
+  mutate(canon_name = virus)
+
+# 3) Map viral accessions -> same canonical names as virtus via lookup
+# Read lookup and make columns unambiguous
+virus_lookup <- read_tsv("~/Desktop/library_report.tsv", show_col_types = FALSE) %>%
+  distinct(reference, virus)          # rename pretty name -> virtus_name
+
+# Virtus: keep its own name as canonical
+virtus_named <- virtus_data %>%
+  mutate(canon_name = virus)
+
+# Viral: map to virtus_name when available, else fall back to its own reference (viral's 'virus')
+viral_named <- viral_data %>%
+  left_join(virus_lookup, by = c("virus" = "reference")) %>%
+  mutate(
+    virus       = as.character(virus),     # fallback to viral's own reference
+  )
+
+count_data_viral <- viral_named %>%
+  filter(numreads > 0) %>%
+  group_by(virus.y) %>%
+  summarise(
+    n_samples = n_distinct(sample_name),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "viral")
+
+```
+
+```{r plot viral against virtus}
+virtus_nr <- virtus_named %>%
+  group_by(sample_name, canon_name) %>%
+  summarise(numreads_virtus = sum(numreads, na.rm = TRUE), .groups = "drop")
+
+viral_nr <- viral_named %>%
+  group_by(virus, virus.y, sample_name) %>%
+  rename(canon_name = virus.y) %>%
+  summarise(numreads_viral = sum(numreads, na.rm = TRUE), .groups = "drop")
+
+viral_totals <- viral_nr %>%
+  group_by(canon_name, sample_name, numreads_viral) %>%
+  summarise(total_numreads = sum(numreads_viral, na.rm = TRUE), .groups = "drop") %>%
+  filter(total_numreads > 1700) %>%
+  arrange(desc(total_numreads))
+
+ggplot(viral_totals, aes(x = reorder(canon_name, total_numreads), y = total_numreads)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Total numreads per virus (viral)",
+    x = "Virus",
+    y = "Total numreads"
+  ) +
+  theme_minimal()
+
+virtus_totals <- virtus_nr %>%
+  group_by(canon_name) %>%
+  summarise(total_numreads = sum(numreads_virtus, na.rm = TRUE), .groups = "drop") %>%
+  filter(total_numreads > 0) %>%               # remove this line if you want all
+  arrange(desc(total_numreads)) %>%
+  mutate(label = str_wrap(canon_name, width = 40))  # wrap long labels
+
+# 2) Plot with smaller text
+ggplot(virtus_totals, aes(x = reorder(label, total_numreads), y = total_numreads)) +
+  geom_col() +
+  coord_flip() +  # nicer big numbers
+  labs(
+    title = "Total numreads per virus (virtus)",
+    x = "Virus",
+    y = "Total numreads"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 7),
+    plot.title  = element_text(size = 12, face = "bold")
+  )
+
+
+
+```
+
+```{r vipr viruses}
+
+vipr_totals <- vipr_data %>%
+  group_by(virus) %>%
+  summarise(total_numreads = sum(numreads, na.rm = TRUE), .groups = "drop") %>%
+  filter(total_numreads > 100000) %>%               # remove this line if you want all
+  arrange(desc(total_numreads)) %>%
+  mutate(label = str_wrap(virus, width = 40))  # wrap long labels
+
+
+ggplot(vipr_totals, aes(x = reorder(label, total_numreads), y = total_numreads)) +
+  geom_col() +
+  coord_flip() +  # nicer big numbers
+  labs(
+    title = "Total numreads per virus (vipr)",
+    x = "Virus",
+    y = "Total numreads"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 7),
+    plot.title  = element_text(size = 12, face = "bold")
+  )
+
+```
+

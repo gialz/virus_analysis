@@ -1,0 +1,354 @@
+---
+title: "rimod_repeats"
+author: "Ginna"
+date: "2025-08-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(broom)
+```
+
+```{r read in repeats and filter using thresholds}
+
+# Function to read, filter, classify, and summarise each file
+process_tsv <- function(file) {
+  df <- read_tsv(file, col_names = FALSE, show_col_types = FALSE)
+  
+  if (nrow(df) == 0) return(NULL)  # Skip empty files safely
+  
+  # Assign correct column names
+  colnames(df) <- c(
+    "query_id", "subject_id", "pident", "alignment_length",
+    "mismatches", "gap_opens", "q_start", "q_end",
+    "s_start", "s_end", "evalue", "bit_score"
+  )
+  
+  # Extract sample name
+  sample_name <- basename(file) %>%
+    str_remove("_repeats") %>%
+    str_remove("\\.tsv$")
+  
+  # Filter, classify, summarise counts per superfamily
+  df_filtered <- df %>%
+    filter(evalue <= 1e-5, pident >= 90, alignment_length >= 30) %>%
+    mutate(
+      superfamily = case_when(
+        str_detect(subject_id, regex("^Alu", ignore_case = TRUE)) ~ "SINE/Alu",
+        str_detect(subject_id, regex("SINE", ignore_case = TRUE)) ~ "SINE/Other",
+        str_detect(subject_id, regex("L1", ignore_case = TRUE)) ~ "LINE/L1",
+        str_detect(subject_id, regex("LINE", ignore_case = TRUE)) ~ "LINE/Other",
+        str_detect(subject_id, regex("SAT", ignore_case = TRUE)) ~ "Satellite",
+        str_detect(subject_id, regex("LTR", ignore_case = TRUE)) ~ "LTR",
+        str_detect(subject_id, regex("DNA", ignore_case = TRUE)) ~ "DNA_transposon",
+        TRUE ~ "Other"
+      ),
+      sample_name = sample_name   # <-- ADD sample_name column here
+    )
+  
+    # --- Sequence-level counts (all sequences with "Sat" in subject_id)
+  seq_counts <- df_filtered %>%
+    filter(str_detect(subject_id, regex("Sat", ignore_case = TRUE))) %>%
+    group_by(sample_name, subject_id) %>%
+    summarise(distinct_reads = n_distinct(query_id), .groups = "drop")
+  
+  # --- Superfamily-level counts (your current summary)
+  super_counts <- df_filtered %>%
+    count(sample_name, superfamily, name = "count")
+  
+  raw_sequences <- df_filtered %>%
+  select(sample_name, subject_id, query_id)
+
+  
+  # Return a list: one element for superfamily counts, one for sequence counts
+  list(
+    super_counts = super_counts,
+    seq_counts   = seq_counts,
+    raw_sequences = raw_sequences
+)
+
+}
+
+output_file <- "~/Desktop/rimod_repeats_summary.csv"
+
+rimod_repeat_files <- list.files(
+  path = "~/Desktop/rimod_collected_repeats",
+  full.names = TRUE,
+  pattern = "\\.tsv$"
+)
+
+results <- map(rimod_repeat_files, process_tsv) %>%
+  compact()  # removes NULLs (from purrr)
+all_superfamily <- map_dfr(results, "super_counts")
+all_sequences   <- map_dfr(results, "seq_counts")
+all_raw_sequences <- map_dfr(results, "raw_sequences")
+#write_csv(all_summaries, output_file)
+
+
+```
+
+```{r normalise data}
+# Read in combined per-sample summary from disk
+
+output_file <- "~/Desktop/rimod_repeats_summary.csv"
+
+family_summary <- read_csv(output_file)
+
+fasta_totals <- read_tsv("~/Desktop/rimod_raw_fasta_totals.tsv")
+
+# Normalise to CPM
+normalised_summary <- family_summary %>%
+  left_join(fasta_totals, by = "sample_name") %>%
+  mutate(
+    total_reads = total_reads_fasta,
+    cpm = count / total_reads * 1e6
+  ) %>%
+  select(-total_reads_fasta)
+
+
+```
+
+```{r join with metadata}
+
+metadata <- read_csv("/Users/ginna/Desktop/internship/practice/virtus2/new_rimod_meta_data_4.csv")
+
+metadata <- metadata %>%
+  rename("sample_name" = "sample")
+
+all_rimod <- left_join(metadata, normalised_summary, by = "sample_name")
+
+all_rimod <- all_rimod %>%
+  select(sample_name, genotype, superfamily, count, total_reads, cpm)
+
+```
+
+```{r wilcoxon and plots}
+#calculate mean cpm
+composition_summary <- all_rimod %>%
+  group_by(genotype, superfamily) %>%
+  summarise(mean_cpm = mean(cpm), .groups = "drop")
+
+#plot mean cpm and type of disease
+ggplot(composition_summary, aes(x = genotype, y = mean_cpm, fill = superfamily)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(y = "Proportion of total CPM", x = "Condition", title = "Repeats by Condition in RIMOD data") +
+  theme_bw()
+
+library(broom)
+library(purrr)
+
+#kruskal test - assumes the same distribution
+kw_tests <- all_rimod %>%
+  filter(!is.na(cpm), is.finite(cpm)) %>%
+  group_by(superfamily) %>%
+  summarise(
+    test = list(kruskal.test(cpm ~ genotype, data = cur_data())),
+    .groups = "drop"
+  ) %>%
+  mutate(result = map(test, broom::tidy)) %>%
+  unnest(result) %>%
+  select(superfamily, statistic, p.value) %>%
+  mutate(p.adj = p.adjust(p.value, "fdr")) %>%
+  arrange(p.adj)
+
+
+#plot significant ones 
+ggplot(kw_tests, aes(x = reorder(superfamily, p.adj), y = -log10(p.adj), fill = p.adj < 0.05)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "Superfamily", y = "-log10(FDR-adjusted p-value)", title = "Differential Abundance by TDP Status in Rimod Data") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "grey")) +
+  theme_bw()
+
+sig_superfamilies <- kw_tests %>%
+  filter(p.adj < 0.05) %>%
+  arrange(p.adj)
+print(sig_superfamilies)
+
+library(ggpubr)
+
+# Filter dataset to significant superfamilies only
+all_rimod_sig <- all_rimod %>% filter(superfamily %in% sig_superfamilies$superfamily)
+
+ggboxplot(all_rimod_sig, x = "genotype", y = "cpm",
+          color = "genotype", palette = "jco",
+          facet.by = "superfamily", scales = "free_y") +
+  stat_compare_means(method = "wilcox.test", label = "p.signif")
+
+library(rstatix)
+
+#does pairwise testing (doesnt assume the same distribution)
+pairwise_tests <- all_rimod %>%
+  filter(!is.na(cpm), is.finite(cpm)) %>%
+  group_by(superfamily) %>%
+  pairwise_wilcox_test(cpm ~ genotype, p.adjust.method = "fdr")
+
+pairwise_tests <- pairwise_tests %>%
+  group_by(superfamily) %>%
+  mutate(y.position = max(all_rimod$cpm[all_rimod$superfamily == unique(superfamily)], na.rm = TRUE) * 1.1 + row_number() * 0.1) %>%
+  ungroup()
+
+sig_pairs <- pairwise_tests %>%
+  filter(p.adj < 0.05) %>%
+  arrange(superfamily, p.adj)
+print(sig_pairs)
+
+
+pairwise_sig <- pairwise_tests %>% filter(p.adj < 0.05)
+
+ggboxplot(all_rimod %>% filter(superfamily %in% pairwise_sig$superfamily),
+          x = "genotype", y = "cpm",
+          color = "genotype", palette = "jco",
+          facet.by = "superfamily", scales = "free_y") +
+  stat_pvalue_manual(pairwise_sig, label = "p.adj.signif", y.position = "y.position") +
+  labs(title = "Significant Pairwise Wilcoxon Tests (FDR-adjusted) for RIMOD data")
+
+
+summary_results <- kw_tests %>%
+  select(superfamily, kw_p.adj = p.adj) %>%
+  left_join(pairwise_tests %>% select(superfamily, group1, group2, pw_p.adj = p.adj),
+            by = "superfamily")
+
+
+```
+
+```{r c9orf72}
+c9_data <- all_rimod %>%
+  filter(genotype %in% c("C9orf72", "control"))
+
+c9_tests <- c9_data %>%
+  group_by(superfamily) %>%
+  summarise(
+    test = list(wilcox.test(cpm ~ genotype)),
+    .groups = "drop"
+  ) %>%
+  mutate(test_result = map(test, broom::tidy)) %>%
+  unnest(test_result) %>%
+  select(superfamily, p.value) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) %>%
+  arrange(p.adj)
+
+sig_superfamilies <- c9_tests %>%
+  filter(p.adj < 0.05) %>%
+  pull(superfamily)
+
+ggboxplot(c9_data %>% filter(superfamily %in% sig_superfamilies),
+          x = "genotype", y = "cpm",
+          color = "genotype", palette = "jco",
+          facet.by = "superfamily", scales = "free_y") +
+  stat_compare_means(method = "wilcox.test", label = "p.signif") +
+  labs(title = "Significant Superfamilies (C9orf72 vs Control)")
+
+ggboxplot(c9_data,
+          x = "genotype", y = "cpm",
+          color = "genotype", palette = "jco",
+          facet.by = "superfamily", scales = "free_y") +
+  stat_compare_means(method = "wilcox.test") +
+  labs(title = "All Superfamilies (C9orf72 vs Control)")
+
+```
+
+```{r correlating satellite/dnatransposon with cell types}
+
+library(GGally)
+
+cell_types <- read_csv("~/Desktop/rimod_cell_type.csv")
+
+targets <- c("DNA_transposon", "Satellite")
+
+new_rimod <- all_rimod %>%
+  filter(superfamily %in% targets) %>%
+  group_by(sample_name, superfamily) %>%
+  summarise(CPM = sum(cpm, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = superfamily,
+    values_from = CPM,
+    values_fill = 0
+  )
+
+
+
+df <- new_rimod %>%
+  left_join(cell_types, by = "sample_name")
+
+num_df <- df %>%
+  select(where(is.numeric)) %>%
+  drop_na(DNA_transposon, Satellite)
+
+# spearman
+GGally::ggpairs(
+  num_df,
+  upper = list(continuous = wrap("cor", method = "spearman")),
+  lower = list(continuous = "smooth"),
+  diag  = list(continuous = "densityDiag"),
+)
+
+#heatmap
+GGally::ggcorr(
+  num_df,
+  method = c("pairwise.complete.obs", "spearman"),
+  label = TRUE,
+  label_round = 2
+)
+```
+
+```{r correlating satellite with excitory neurons}
+
+cell_types <- read_csv("~/Desktop/rimod_cell_type.csv")
+
+targets <- "Satellite"
+
+new_rimod <- all_rimod %>%
+  filter(superfamily %in% targets) %>%
+  group_by(sample_name, superfamily, genotype) %>%
+  summarise(CPM = sum(cpm, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = superfamily,
+    values_from = CPM,
+    values_fill = 0
+  )
+
+df <- new_rimod %>%
+  left_join(cell_types, by = "sample_name") %>%
+  select(sample_name, genotype, Satellite, ExNeurons)
+
+# spearman
+ggpairs(
+  df,
+  columns = c("Satellite", "ExNeurons"),
+  mapping = aes(color = genotype),
+  upper = list(continuous = wrap("cor", method = "spearman",
+                                         use = "pairwise.complete.obs")),
+  lower = list(continuous = "points"),
+)
+
+#heatmap
+ggcorr(
+  df,
+  method = c("pairwise.complete.obs", "spearman"),
+  label = TRUE,
+  label_round = 2
+)
+
+```
+
+```{r generates a list of query ids that can be used to download a specific satellite sequence}
+#number of distinct reads of satellites
+#sequence of satellites - especially LSAU-Satellite-Homo
+satellite_count <- all_sequences %>%
+  filter(subject_id == "LSAU-Satellite-Homo") %>%
+  arrange(desc(distinct_reads))
+
+lsau_reads <- all_raw_sequences %>%
+  filter(subject_id == "LSAU-Satellite-Homo") %>%
+  pull(query_id)
+writeLines(lsau_reads, "lsau_read_ids.txt")
+```
+

@@ -1,0 +1,138 @@
+---
+title: "nygc_virtus_pathonoia"
+author: "Ginna"
+date: "2025-08-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggpubr)
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(corrplot)
+library(ggcorrplot)
+```
+
+```{r reading in virtus data}
+customized_read_tsv <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    mutate(
+      fileName = basename(file),
+      sample_name = str_remove(fileName, "_VIRTUS.output.tsv$")
+    )
+}
+
+# Get list of non-empty .tsv files
+files <- list.files(
+  path = "/Users/ginna/Desktop/internship/practice/virtus2/virtus_nygc_final",
+  full.names = TRUE,
+  pattern = "\\.tsv$"
+)
+
+files <- files[file.size(files) > 0]  # keep only non-empty files
+
+# Read, filter, combine
+virtus_data <- files %>%
+  lapply(customized_read_tsv) %>%
+  Filter(function(df) !is.null(df) && nrow(df) > 0, .) %>%
+  bind_rows() %>%
+  select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq, rate_hit) %>%
+  mutate(software = "virtus")
+
+```
+
+```{r Read Counts per virus in NYGC VIRTUS Data, echo=FALSE}
+virtus_data <- virtus_data %>%
+  mutate(virus = fct_reorder(virus, numreads, .fun=median))
+
+count_data_v <- virtus_data %>%
+  group_by(virus) %>%
+  summarise(n = n())  # just count number of rows per virus
+
+count_data_v %>%
+    mutate(software = "virtus")
+
+ggplot(virtus_data, aes(x = virus, y = numreads)) +
+  geom_boxplot() +
+  coord_flip() +
+  geom_text(
+  data = count_data_v,
+  aes(x = virus, y = max(virtus_data$numreads, na.rm = TRUE) * 1.05, label = paste("n =", n)),
+  inherit.aes = FALSE,
+  size = 2.5,
+  hjust = -0.1) +
+  labs(title = "Read Counts per virus in NYGC_ALSFTD VIRTUS Data",
+      x = "virus",
+      y = "Number of Reads") +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+```{r reading in pathonoia data}
+# Load the data
+pathonoia <- read_csv("~/Desktop/internship/practice/VIRTUS2/nygc_contamination.csv")
+
+# Convert to long format
+pathonoia_long <- pathonoia %>%
+  pivot_longer(
+    cols = -c(species_name, phylo_level, parent),
+    names_to = "sample_name",
+    values_to = "value"
+  )
+
+pathonoia_long <- pathonoia_long %>%
+  mutate(software = "pathonoia")
+
+count_data_p <- pathonoia_long %>%
+  group_by(species_name) %>%
+  summarise(total_count = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_count))
+
+count_data_p %>% 
+    mutate(software = "pathonoia")
+
+```
+
+```{r}
+read_threshold <- 1000
+
+pathonoia_long <- pathonoia_long %>%
+  filter(value >= read_threshold) %>%
+  group_by(species_name) %>%
+  filter(n_distinct(sample_name) > 1) %>%
+  ungroup() %>%
+  mutate(species_name = fct_reorder(species_name, value, .fun = median, .desc = TRUE))
+
+# 2) Recompute count_data from the same filtered df_long_ebv
+count_data <- pathonoia_long %>%
+  group_by(species_name) %>%
+  summarise(n = n_distinct(sample_name), .groups = "drop")
+
+# 3) Plot (labels always match the data shown)
+y_top <- max(pathonoia_long$value, na.rm = TRUE) * 1.05
+
+ggplot(pathonoia_long, aes(x = species_name, y = value)) +
+  geom_boxplot(outlier.size = 0.5) +
+  coord_flip() +
+  geom_text(
+    data = count_data,
+    aes(x = species_name, y = y_top, label = paste("n =", n)),
+    inherit.aes = FALSE, size = 2.5, hjust = -0.1
+  ) +
+  labs(
+    title = "Read Counts per species_name in NYGC_ALSFTD Pathonoia Data",
+    x = "species_name (species_name)", y = "Read Count"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.y = element_text(size = 6),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```

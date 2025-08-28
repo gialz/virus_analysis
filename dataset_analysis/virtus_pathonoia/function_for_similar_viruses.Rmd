@@ -1,0 +1,311 @@
+---
+title: "matching_database"
+author: "Ginna"
+date: "2025-08-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggpubr)
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(corrplot)
+library(ggcorrplot)
+```
+
+```{r read in both virus tables}
+
+virtus_virus = read.csv("~/Desktop/internship/practice/VIRTUS2/full_virtus_virus.csv")
+pathonoia_virus = read.csv("~/Desktop/internship/practice/VIRTUS2/full_pathonoia_virus.csv")
+
+pathonoia_virus <- pathonoia_virus %>%
+  rename(pathonoia_name = virus_name)
+```
+
+```{r join both}
+all_virus <- inner_join(virtus_virus, pathonoia_virus, by = "reference")
+
+all_virus <- all_virus %>%
+  mutate(across(everything(), ~ str_trim(as.character(.x))))
+
+all_virus <- all_virus %>%
+  mutate(across(c(pathonoia_name, virtus_name), ~ tolower(as.character(.x))))
+
+
+
+write_csv(all_virus, "~/Desktop/all_virus_clean.csv")
+
+```
+
+```{r read in rimod data and do counts}
+df <- read_csv("~/Desktop/internship/practice/virtus2/nygc_contamination.csv")
+
+# Convert to long format
+df_long <- df %>%
+  pivot_longer(
+    cols = -c(species_name, phylo_level, parent),
+    names_to = "sample_name",
+    values_to = "value"
+  )
+
+df_long <- df_long %>%
+  mutate(software = "pathonoia")
+
+count_data_p <- df_long %>%
+  group_by(species_name) %>%
+  summarise(total_count = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_count))
+
+count_data_p %>% 
+    mutate(software = "pathonoia")
+
+
+# Get list of non-empty .tsv files
+files <- list.files(
+  path = "/Users/ginna/Desktop/internship/practice/virtus2/virtus_nygc_final",
+  full.names = TRUE,
+  pattern = "\\.tsv$"
+)
+
+files <- files[file.size(files) > 0]  # keep only non-empty files
+
+# Read, filter, combine
+virtus_rimod_data <- files %>%
+  lapply(customized_read_tsv) %>%
+  Filter(function(df) !is.null(df) && nrow(df) > 0, .) %>%
+  bind_rows() %>%
+  select(sample_name, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq, rate_hit) %>%
+  mutate(software = "virtus")
+
+
+virtus_rimod_data <- virtus_rimod_data %>%
+  mutate(software = "virtus")
+
+virtus_rimod_data <- virtus_rimod_data %>%
+  mutate(virus = fct_reorder(virus, numreads, .fun=median))
+
+count_data_v <- virtus_rimod_data %>%
+  group_by(virus) %>%
+  summarise(n = n())  # just count number of rows per virus
+
+count_data_v %>%
+    mutate(software = "virtus")
+```
+
+```{r rename some columns}
+
+count_data_p <- count_data_p %>%
+  rename(virus = species_name)
+
+count_data_v <- count_data_v %>%
+  rename(total_count = n)
+
+count_data_p <- count_data_p %>%
+  mutate(software = 'pathonoia')
+
+count_data_v <- count_data_v %>%
+  mutate(software = 'virtus')
+
+# cleaned table
+all_virus <- read_csv("~/Desktop/internship/practice/virtus2/all_virus_clean.csv")
+
+all_virus_count = bind_rows(count_data_p, count_data_v)
+
+```
+
+```{r similarities function}
+library(dplyr)
+library(stringr)
+library(readr)
+
+all_virus_count <- all_virus_count %>%
+  mutate(across(c(virus), ~ tolower(as.character(.x))))
+
+# helpers
+norm <- function(x) x %>% tolower() %>% 
+  str_replace_all("\\([^)]*\\)|\\[[^]]*\\]", " ") %>%
+  str_replace_all("[^a-z0-9 ]+", " ") %>% str_squish()
+
+# lookups (named vectors)
+ref_lookup <- setNames(all_virus$virtus_name, toupper(all_virus$reference))
+
+# Pathonoia table with normalised names
+path_map <- all_virus %>%
+  mutate(path_norm = norm(pathonoia_name))
+
+# Regex for VIRTUS references
+escape_rx <- function(x) str_replace_all(x, "([.^$|()*+?{}\\\\\\[\\]])", "\\\\\\1")
+ref_rx <- paste0("(?:", paste(escape_rx(unique(all_virus$reference)), collapse="|"), ")")
+
+# Function to get Pathonoia match
+get_path_match <- function(virus) {
+  name_norm <- norm(virus)
+  name_sub  <- str_sub(name_norm, 1, 30) # first 20 chars
+  hit <- path_map %>%
+    filter(str_detect(path_norm, fixed(name_sub))) %>%
+    slice(1) %>%
+    pull(virtus_name)
+  if (length(hit) == 0) return(NA_character_)
+  hit
+}
+
+# Apply matching
+counts_labeled <- all_virus_count %>%
+  mutate(
+    ref         = toupper(str_extract(virus, regex(ref_rx, ignore_case = TRUE))),
+    path_match  = map_chr(virus, get_path_match),
+    new_name    = coalesce(ref_lookup[ref], path_match, "UNKNOWN")
+  )
+
+counts_labeled
+# optional: write_csv(counts_labeled, "~/Desktop/counts_with_new_name.csv")
+
+```
+
+```{r plot}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+common <- counts_labeled %>%
+  filter(!is.na(new_name), new_name != "UNKNOWN") %>%
+  mutate(software = tolower(software)) %>%
+  group_by(new_name, software) %>%
+  summarise(total_count = sum(total_count, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = software, values_from = total_count) %>%
+  drop_na(virtus, pathonoia)  # keep only where both tools have counts
+
+# Plot
+library(ggrepel)
+
+ggplot(common, aes(x = virtus, y = pathonoia)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+  geom_point(size = 2) +
+  geom_text_repel(aes(label = new_name), size = 3, max.overlaps = Inf) +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(trans = "log10") +
+  labs(
+    title = "Viruses detected by both Pathonoia and VIRTUS in NYGC_ALSFTD data",
+    x = "VIRTUS total numreads",
+    y = "Pathonoia total value"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r}
+# Standardize virtus data
+virtus_std <- virtus_rimod_data %>%
+  select(sample_name, virus, software, value = numreads)  # or whatever metric you want to use
+
+# Standardize pathonoia data  
+pathonoia_std <- df_long %>%
+  rename(virus = species_name) %>%
+  select(sample_name, virus, software, value)
+
+# Now combine them
+all_virus_data <- bind_rows(virtus_std, pathonoia_std)
+
+all_virus_data <- all_virus_data %>%
+  mutate(across(c(virus), ~ tolower(as.character(.x))))
+
+# helpers
+norm <- function(x) x %>% tolower() %>% 
+  str_replace_all("\\([^)]*\\)|\\[[^]]*\\]", " ") %>%
+  str_replace_all("[^a-z0-9 ]+", " ") %>% str_squish()
+
+# lookups (named vectors)
+ref_lookup <- setNames(all_virus$virtus_name, toupper(all_virus$reference))
+
+# Pathonoia table with normalised names
+path_map <- all_virus %>%
+  mutate(path_norm = norm(pathonoia_name))
+
+# Regex for VIRTUS references
+escape_rx <- function(x) str_replace_all(x, "([.^$|()*+?{}\\\\\\[\\]])", "\\\\\\1")
+ref_rx <- paste0("(?:", paste(escape_rx(unique(all_virus$reference)), collapse="|"), ")")
+
+# Function to get Pathonoia match
+get_path_match <- function(virus) {
+  name_norm <- norm(virus)
+  name_sub  <- str_sub(name_norm, 1, 30) # first 30 chars
+  hit <- path_map %>%
+    filter(str_detect(path_norm, fixed(name_sub))) %>%
+    slice(1) %>%
+    pull(virtus_name)
+  if (length(hit) == 0) return(NA_character_)
+  hit
+}
+
+# Apply matching
+counts_labeled <- all_virus_data %>%
+  mutate(
+    ref         = toupper(str_extract(virus, regex(ref_rx, ignore_case = TRUE))),
+    path_match  = map_chr(virus, get_path_match),
+    new_name    = coalesce(ref_lookup[ref], path_match, "UNKNOWN")
+  )
+
+counts_labeled
+
+common <- counts_labeled %>%
+  filter(!is.na(new_name), new_name != "UNKNOWN") %>%
+  mutate(software = tolower(software)) %>%
+  group_by(sample_name, new_name, software) %>%  # Include sample_name in grouping
+  summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = software, values_from = value, values_fill = 0) %>%
+  filter(virtus > 0, pathonoia > 0)  # Both tools detected this virus in this sample
+
+
+# Plot
+library(ggrepel)
+
+ggplot(common, aes(x = virtus, y = pathonoia)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+  geom_point(size = 2) +
+  geom_text_repel(aes(label = new_name), size = 2) +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(trans = "log10") +
+  labs(
+    title = "Viruses detected by both Pathonoia and VIRTUS in NYGC_ALSFTD data",
+    x = "VIRTUS total numreads",
+    y = "Pathonoia total value"
+  ) +
+  theme_minimal() +
+  stat_cor(method = 'spearman', cor.coef.name = 'rho')
+```
+
+
+```{r}
+metadata = read.csv("~/Desktop/internship/practice/virtus2/filtered_nygc.csv")
+
+metadata <- metadata %>%
+  rename('sample_name' = 'sample_id_rna')
+  
+combined_common = left_join(common, metadata, by = "sample_name")
+
+ggplot(combined_common, aes(x = virtus, y = pathonoia, colour = as.factor(tdp_proteinopathy))) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+  geom_point(size = 2) +
+  geom_text_repel(aes(label = new_name), size = 2) +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(trans = "log10") +
+  labs(
+    title = "Viruses detected by both Pathonoia and VIRTUS in NYGC_ALSFTD data",
+    x = "VIRTUS total numreads",
+    y = "Pathonoia total value",
+    colour = "Source Name"
+  ) +
+  theme_minimal() +
+  stat_cor(method = "spearman", cor.coef.name = "rho")
+
+```
+

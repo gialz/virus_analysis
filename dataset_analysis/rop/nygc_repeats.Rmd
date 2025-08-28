@@ -1,0 +1,493 @@
+---
+title: "nygc_repeats"
+author: "Ginna"
+date: "2025-08-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(broom)
+library(ggrepel)
+```
+
+```{r read in repeats and filter using thresholds}
+
+# Function to read, filter, classify, and summarise each file
+process_tsv <- function(file) {
+  df <- read_tsv(file, col_names = FALSE, show_col_types = FALSE)
+  
+  if (nrow(df) == 0) return(NULL)  # Skip empty files safely
+  
+  # Assign correct column names
+  colnames(df) <- c(
+    "query_id", "subject_id", "pident", "alignment_length",
+    "mismatches", "gap_opens", "q_start", "q_end",
+    "s_start", "s_end", "evalue", "bit_score"
+  )
+  
+  # Extract sample name
+  sample_name <- basename(file) %>%
+    str_remove("_repeats") %>%
+    str_remove("\\.tsv$")
+  
+  # Filter, classify, summarise counts per superfamily
+  df_filtered <- df %>%
+    filter(evalue <= 1e-5, pident >= 90, alignment_length >= 30) %>%
+    mutate(
+      superfamily = case_when(
+        str_detect(subject_id, regex("^Alu", ignore_case = TRUE)) ~ "SINE/Alu",
+        str_detect(subject_id, regex("SINE", ignore_case = TRUE)) ~ "SINE/Other",
+        str_detect(subject_id, regex("L1", ignore_case = TRUE)) ~ "LINE/L1",
+        str_detect(subject_id, regex("LINE", ignore_case = TRUE)) ~ "LINE/Other",
+        str_detect(subject_id, regex("SAT", ignore_case = TRUE)) ~ "Satellite",
+        str_detect(subject_id, regex("LTR", ignore_case = TRUE)) ~ "LTR",
+        str_detect(subject_id, regex("DNA", ignore_case = TRUE)) ~ "DNA_transposon",
+        TRUE ~ "Other"
+      ),
+      sample_name = sample_name   # <-- ADD sample_name column here
+    )
+  
+    # --- Sequence-level counts (all sequences with "Sat" in subject_id)
+  seq_counts <- df_filtered %>%
+    filter(str_detect(subject_id, regex("Sat", ignore_case = TRUE))) %>%
+    group_by(sample_name, subject_id) %>%
+    summarise(distinct_reads = n_distinct(query_id), .groups = "drop")
+  
+  # --- Superfamily-level counts (your current summary)
+  super_counts <- df_filtered %>%
+    count(sample_name, superfamily, name = "count")
+  
+  raw_sequences <- df_filtered %>%
+  select(sample_name, subject_id, query_id)
+
+  
+  # Return a list: one element for superfamily counts, one for sequence counts
+  list(
+    super_counts = super_counts,
+    seq_counts   = seq_counts,
+    raw_sequences = raw_sequences
+)
+
+}
+
+output_file <- "/Users/ginna/Desktop/nygc_repeats_summary.csv"
+
+nygc_repeat_files <- list.files(
+  path = "/Users/ginna/Desktop/nygc_collected_repeats/",
+  full.names = TRUE,
+  pattern = "\\.tsv$"
+)
+
+#all_summaries <- map_dfr(nygc_repeat_files, process_tsv)
+results <- map(nygc_repeat_files, process_tsv) %>%
+  compact()  # removes NULLs (from purrr)
+all_superfamily <- map_dfr(results, "super_counts")
+all_sequences   <- map_dfr(results, "seq_counts")
+all_raw_sequences <- map_dfr(results, "raw_sequences")
+
+#write_csv(all_summaries, output_file)
+
+
+```
+
+```{r normalise data}
+# Read in combined per-sample summary from disk
+
+output_file <- "/Users/ginna/Desktop/nygc_repeats_summary.csv"
+
+family_summary <- read_csv(output_file)
+
+fasta_totals <- read_tsv("~/Desktop/nygc_raw_fasta_totals.tsv")
+
+# Normalise to CPM
+normalised_summary <- family_summary %>%
+  left_join(fasta_totals, by = "sample_name") %>%
+  mutate(
+    total_reads = total_reads_fasta,
+    cpm = count / total_reads * 1e6
+  ) %>%
+  select(-total_reads_fasta)
+
+
+```
+
+```{r join with metadata}
+
+metadata <- read_csv("~/Desktop/internship/practice/virtus2/filtered_nygc.csv")
+
+metadata <- metadata %>%
+  rename("sample_name" = "sample_id_rna")
+
+all_nygc <- left_join(metadata, normalised_summary, by = "sample_name")
+
+all_nygc <- all_nygc %>%
+  select(sample_name, tdp_proteinopathy, superfamily, count, total_reads, cpm, c9orf72_eh)
+
+all_nygc <- all_nygc %>%
+  mutate(
+    group = case_when(
+      tdp_proteinopathy == "FTLD-TDP" & c9orf72_eh == TRUE  ~ "FTLD-TDP_c9pos",
+      tdp_proteinopathy == "FTLD-TDP" & c9orf72_eh == FALSE ~ "FTLD-TDP_c9neg",
+      tdp_proteinopathy == "Control" ~ "Control",
+      TRUE ~ "Other"
+    )
+  )
+
+```
+
+```{r wilcoxon and plots - FTLD vs Control}
+#calculate mean cpm
+composition_summary <- all_nygc %>%
+  group_by(tdp_proteinopathy, superfamily) %>%
+  summarise(mean_cpm = mean(cpm), .groups = "drop")
+
+#plot mean cpm and type of disease
+ggplot(composition_summary, aes(x = tdp_proteinopathy, y = mean_cpm, fill = superfamily)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(y = "Proportion of total CPM", x = "Condition", title = "Repeats by Condition in NYGC data") +
+  theme_bw()
+
+#wilcoxen rank sum test
+superfamily_tests <- all_nygc %>%
+  filter(!is.na(superfamily)) %>%                   
+  group_by(superfamily) %>%
+  filter(n_distinct(tdp_proteinopathy) == 2) %>%     
+  summarise(
+    test = list(wilcox.test(cpm ~ tdp_proteinopathy)),
+    .groups = "drop"
+  ) %>%
+  #adjust p values
+  mutate(test_result = map(test, broom::tidy)) %>%
+  unnest(test_result) %>%
+  select(superfamily, statistic, p.value, method) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) %>%
+  arrange(p.adj)
+
+#filter out the significant ones
+sig_superfamilies <- superfamily_tests %>%
+  filter(p.adj < 0.05) %>%
+  arrange(p.adj)
+print(sig_superfamilies)
+
+#plot significant ones 
+ggplot(superfamily_tests, aes(x = reorder(superfamily, p.adj), y = -log10(p.adj), fill = p.adj < 0.05)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "Superfamily", y = "-log10(FDR-adjusted p-value)", title = "Differential Abundance by TDP Status in NYGC data") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "grey")) +
+  theme_bw()
+
+
+library(ggpubr)
+
+# Filter dataset to significant superfamilies only
+all_nygc_sig <- all_nygc %>% filter(superfamily %in% sig_superfamilies$superfamily)
+
+ggboxplot(all_nygc_sig, x = "tdp_proteinopathy", y = "cpm",
+          color = "tdp_proteinopathy", palette = "jco",
+          facet.by = "superfamily", scales = "free_y") +
+  stat_compare_means(method = "wilcox.test", label = "p.signif")
+
+#volcano plot
+# Calculate mean CPM per condition (Control vs TDP)
+fc_data <- all_nygc %>%
+  filter(!is.na(superfamily), !is.na(tdp_proteinopathy)) %>%
+  group_by(superfamily, tdp_proteinopathy) %>%
+  summarise(mean_cpm = mean(cpm), .groups = "drop") %>%
+  pivot_wider(names_from = tdp_proteinopathy, values_from = mean_cpm) %>%
+  mutate(log2FoldChange = log2((`FTLD-TDP` + 1) / (`Control` + 1)))
+
+
+volcano_data <- superfamily_tests %>%
+  left_join(fc_data, by = "superfamily") %>%
+  mutate(
+    negLog10P = -log10(p.value)
+  )
+
+#volcano plot by groups
+ggplot(volcano_data, aes(x = log2FoldChange, y = negLog10P, color = p.adj < 0.05)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "purple") +
+  geom_vline(xintercept = c(0), linetype = "dashed", color = "purple") +
+  geom_text_repel(data = subset(volcano_data, p.adj < 0.05),
+                  aes(label = superfamily), size = 3) +
+  labs(x = "Log2 Fold Change (TRUE VS FALSE)",
+       y = "-log10(P-value)",
+       title = "Volcano Plot of Superfamily Abundance in NYGC data") +
+  scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
+  theme_bw()
+
+
+```
+
+```{r wilcoxon and plots - c9orf separate to controls}
+# Filter for C9+ and C9− FTLD-TDP only
+c9_data <- all_nygc %>%
+  filter(group %in% c("FTLD-TDP_c9pos", "FTLD-TDP_c9neg"))
+
+# Statistical test per superfamily (Wilcoxon)
+c9_tests <- c9_data %>%
+  group_by(superfamily) %>%
+  summarise(
+    test = list(wilcox.test(cpm ~ group)),
+    .groups = "drop"
+  ) %>%
+  mutate(test_result = map(test, broom::tidy)) %>%
+  unnest(test_result) %>%
+  select(superfamily, p.value)
+
+# Mean CPM & Log2 Fold Change
+fc_data <- c9_data %>%
+  group_by(superfamily, group) %>%
+  summarise(mean_cpm = mean(cpm), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_cpm) %>%
+  mutate(log2FoldChange = log2((`FTLD-TDP_c9pos` + 1) / (`FTLD-TDP_c9neg` + 1)))
+
+# Combine fold change + p-values
+volcano_data_c9 <- left_join(fc_data, c9_tests, by = "superfamily") %>%
+  mutate(
+    negLog10P = -log10(p.value),
+    p.adj = p.adjust(p.value, method = "fdr")
+  )
+
+# Volcano Plot
+ggplot(volcano_data_c9, aes(x = log2FoldChange, y = negLog10P, color = p.adj < 0.05)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "purple") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "purple") +
+  geom_text_repel(data = subset(volcano_data_c9, p.adj < 0.05),
+                  aes(label = superfamily), size = 3) +
+  labs(x = "Log2 Fold Change (C9+ vs C9−)",
+       y = "-log10(P-value)",
+       title = "Volcano Plot: FTLD-TDP C9+ vs C9−") +
+  scale_color_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
+  theme_bw()
+
+# Filter to relevant groups (remove "Other")
+plot_data <- all_nygc %>%
+  filter(group %in% c("Control", "FTLD-TDP_c9neg", "FTLD-TDP_c9pos"),
+         superfamily %in% sig_superfamilies$superfamily)
+
+ggboxplot(plot_data, x = "group", y = "cpm",
+          color = "group", palette = "jco",
+          facet.by = "superfamily", scales = "free_y") +
+  stat_compare_means(method = "wilcox.test", label = "p.signif")
+
+
+
+```
+
+```{r volcano plot for c9orf72}
+c9_data <- all_nygc %>%
+  filter(group %in% c("Control", "FTLD-TDP_c9pos", "FTLD-TDP_c9neg"))
+
+# Mean CPM per group
+fc_data <- c9_data %>%
+  group_by(superfamily, group) %>%
+  summarise(mean_cpm = mean(cpm), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_cpm) %>%
+  mutate(
+    log2FC_C9pos_vs_C9neg   = log2((`FTLD-TDP_c9pos` + 1) / (`FTLD-TDP_c9neg` + 1)),
+    log2FC_C9pos_vs_Control = log2((`FTLD-TDP_c9pos` + 1) / (`Control` + 1)),
+    log2FC_C9neg_vs_Control = log2((`FTLD-TDP_c9neg` + 1) / (`Control` + 1))
+  )
+
+# P-values for each comparison
+pvals <- c9_data %>%
+  group_by(superfamily) %>%
+  filter(
+    sum(group == "FTLD-TDP_c9pos") > 0,
+    sum(group == "FTLD-TDP_c9neg") > 0,
+    sum(group == "Control") > 0
+  ) %>%
+  summarise(
+    p_C9pos_vs_C9neg   = wilcox.test(cpm[group == "FTLD-TDP_c9pos"],
+                                     cpm[group == "FTLD-TDP_c9neg"])$p.value,
+    p_C9pos_vs_Control = wilcox.test(cpm[group == "FTLD-TDP_c9pos"],
+                                     cpm[group == "Control"])$p.value,
+    p_C9neg_vs_Control = wilcox.test(cpm[group == "FTLD-TDP_c9neg"],
+                                     cpm[group == "Control"])$p.value,
+    .groups = "drop"
+  )
+
+
+# Combine FC + P-values in long format
+volcano_data <- fc_data %>%
+  left_join(pvals, by = "superfamily") %>%
+  pivot_longer(
+    cols = starts_with("log2FC"),
+    names_to = "comparison",
+    values_to = "log2FC"
+  ) %>%
+  mutate(
+    pval = case_when(
+      comparison == "log2FC_C9pos_vs_C9neg"   ~ p_C9pos_vs_C9neg,
+      comparison == "log2FC_C9pos_vs_Control" ~ p_C9pos_vs_Control,
+      comparison == "log2FC_C9neg_vs_Control" ~ p_C9neg_vs_Control
+    ),
+    negLog10P = -log10(pval),
+    p.adj = p.adjust(pval, method = "fdr")
+  )
+
+
+```
+
+```{r correlation by cell type}
+library(GGally)
+
+cell_types <- read_csv("~/Desktop/nygc_cell-Type_2.csv")
+
+targets <- c("LINE/L1", "DNA_transposon", "Satellite")
+
+new_nygc <- all_nygc %>%
+  filter(superfamily %in% targets) %>%
+  group_by(sample_name, superfamily) %>%
+  summarise(CPM = sum(cpm, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = superfamily,
+    values_from = CPM,
+    values_fill = 0
+  )
+
+
+df <- new_nygc %>%
+  left_join(cell_types, by = "sample_name") %>%
+  select(-biological_sex)
+
+df <- df %>%
+  rename(
+    LINE_L1 = `LINE/L1`,
+  )
+
+num_df <- df %>%
+  select(where(is.numeric)) %>%
+  drop_na(`LINE_L1`, DNA_transposon, Satellite)
+
+# spearman
+GGally::ggpairs(
+  num_df,
+  upper = list(continuous = wrap("cor", method = "spearman")),
+  lower = list(continuous = "smooth"),
+  diag  = list(continuous = "densityDiag"),
+)
+
+#heatmap
+GGally::ggcorr(
+  num_df,
+  method = c("pairwise.complete.obs", "spearman"),
+  label = TRUE,
+  label_round = 2
+)
+```
+
+```{r correlation by cell type with disease}
+cell_types <- read_csv("~/Desktop/nygc_cell-Type_2.csv")
+
+targets <- c("LINE/L1", "DNA_transposon", "Satellite")
+
+new_nygc <- all_nygc %>%
+  filter(superfamily %in% targets) %>%
+  group_by(sample_name, superfamily) %>%
+  summarise(CPM = sum(cpm, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = superfamily,
+    values_from = CPM,
+    values_fill = 0
+  )
+
+df <- new_nygc %>%
+  left_join(cell_types, by = "sample_name") %>%
+  select(-biological_sex)
+
+# spearman with tdp_proteinopathy
+ggpairs(
+  df,
+  columns = c("Satellite", "excitatory_neuron"),
+  mapping = aes(color = tdp_proteinopathy),
+  upper = list(continuous = wrap("cor", method = "spearman",
+                                         use = "pairwise.complete.obs")),
+  lower = list(continuous = "points"),
+)
+
+#spearman with disease primary
+ggpairs(
+  df,
+  columns = c("Satellite", "excitatory_neuron"),
+  mapping = aes(color = disease_primary),
+  upper = list(continuous = wrap("cor", method = "spearman",
+                                         use = "pairwise.complete.obs")),
+  lower = list(continuous = "points"),
+)
+
+```
+
+```{r correlation using deconv}
+library(GGally)
+
+cell_types <- read_tsv("~/Desktop/deconv_nygc.tsv")
+
+targets <- c("Satellite")
+
+new_nygc <- all_nygc %>%
+  filter(superfamily %in% targets) %>%
+  group_by(sample_name, superfamily) %>%
+  summarise(CPM = sum(cpm, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = superfamily,
+    values_from = CPM,
+    values_fill = 0
+  )
+
+
+df <- new_nygc %>%
+  left_join(cell_types, by = "sample_name") %>%
+  filter(cell == 'neurons') %>%
+  mutate(deconv = as.numeric(deconv))
+
+#keep neurons in cell
+#correlate deconv by satellite
+
+num_df <- df %>%
+  select(where(is.numeric)) %>%
+  drop_na(Satellite)
+
+num_df <- num_df %>%
+  select(Satellite, deconv)
+
+# spearman
+GGally::ggpairs(
+  num_df,
+  upper = list(continuous = wrap("cor", method = "spearman")),
+  lower = list(continuous = "smooth"),
+  diag  = list(continuous = "densityDiag"),
+)
+
+#heatmap
+GGally::ggcorr(
+  num_df,
+  method = c("pairwise.complete.obs", "spearman"),
+  label = TRUE,
+  label_round = 2
+)
+```
+
+```{r use to download query id for satellite sequences}
+#number of distinct reads of satellites
+#sequence of satellites - especially LSAU-Satellite-Homo
+satellite_count <- all_sequences %>%
+  filter(subject_id == "LSAU-Satellite-Homo") %>%
+  arrange(desc(distinct_reads))
+
+lsau_reads <- all_raw_sequences %>%
+  filter(subject_id == "LSAU-Satellite-Homo") %>%
+  pull(query_id)
+writeLines(lsau_reads, "lsau_read_ids.txt")
+```
+

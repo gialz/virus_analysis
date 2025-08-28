@@ -1,0 +1,180 @@
+---
+title: "virtus_hiv"
+author: "Ginna"
+date: "2025-08-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggpubr)
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(corrplot)
+library(ggcorrplot)
+```
+
+```{r reading in virtus data}
+customized_read_tsv <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    mutate(fileName = basename(file),
+    Accession = str_remove(fileName, "_VIRTUS.output.tsv$"))
+}
+
+# Apply the function to all .tsv files and process
+virtus_hiv_data <- list.files(path = "/Users/ginna/Desktop/internship/practice/virtus2/virtus_hiv_final",
+           full.names = TRUE,
+           pattern = "\\.tsv$") %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq, rate_hit)
+
+virtus_hiv_data <- virtus_hiv_data %>%
+  mutate(
+    virus = if_else(
+      str_detect(virus, "\\|"),
+      str_extract(virus, "(?<=\\|)[^|]+$"),
+      virus
+    ),
+    virus = str_replace_all(virus, "_", " "),
+    virus = str_remove(virus, ", complete genome$"),
+    virus = str_remove(virus, ", genomic RNA, isolate Ib An 5550"),
+    virus = str_remove(virus, "NC [^ ]*?\\.(1|2)"),
+    virus = str_remove(virus, "^\\.([12])\\s*"),
+    virus = str_trim(virus)
+  )
+```
+
+```{r ggplot, echo=FALSE}
+virtus_hiv_data <- virtus_hiv_data %>%
+  mutate(virus = fct_reorder(virus, numreads, .fun=median))
+
+count_data <- virtus_hiv_data %>%
+  group_by(virus) %>%
+  summarise(n = n())  # just count number of rows per virus
+
+ggplot(virtus_hiv_data, aes(x = virus, y = numreads)) +
+  geom_boxplot() +
+  coord_flip() +
+  geom_text(
+  data = count_data,
+  aes(x = virus, y = max(virtus_hiv_data$numreads, na.rm = TRUE) * 1.05, label = paste("n =", n)),
+  inherit.aes = FALSE,
+  size = 2.5,
+  hjust = -0.1) +
+  labs(title = "Read Counts per Virus in HIV VIRTUS Data",
+      x = "Virus",
+      y = "Number of Reads") +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+```{r pathonoia filtered HIV}
+library(tidyverse)
+
+# Load the data
+df <- read_csv("~/Desktop/internship/practice/virtus2/HIV_Pathonoia_contamination.csv")
+
+# Convert to long format
+df_long <- df %>%
+  pivot_longer(
+    cols = -c(virus, phylo_level, parent),
+    names_to = "sample_name",
+    values_to = "value"
+  )
+
+# View the result
+head(df_long)
+
+count_data <- df_long %>%
+  filter(value >= 1000) %>%  # set your actual threshold here
+  group_by(virus) %>%
+  summarise(n = n_distinct(sample_name))
+
+read_threshold <- 100
+
+df_long <- df_long %>%
+  filter(value >= read_threshold)
+
+
+ggplot(df_long, aes(x = virus, y = value)) +
+  geom_boxplot(outlier.size = 0.5) +
+  coord_flip() +
+  geom_text(
+    data = count_data %>% filter(virus %in% df_long$virus),
+    aes(x = virus, y = max(df_long$value, na.rm = TRUE) * 1.05, label = paste("n =", n)),
+    inherit.aes = FALSE,
+    size = 2.5,
+    hjust = -0.1
+  ) +
+  labs(
+    title = "Read Counts per Virus in filtered HIV Data using Pathonoia",
+    x = "Virus (species_name)",
+    y = "Read Count"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+
+
+
+```
+
+```{r pathonoia unfiltered HIV}
+df <- read_csv("~/Desktop/internship/practice/virtus2/HIV_Pathonoia_unfiltered_contamination.csv")
+
+# Convert to long format
+df_long <- df %>%
+  pivot_longer(
+    cols = -c(species_name, phylo_level, parent),
+    names_to = "sample_name",
+    values_to = "value"
+  )
+
+# View the result
+head(df_long)
+
+count_data <- df_long %>%
+  filter(value >= 1000) %>%  # set your actual threshold here
+  group_by(species_name) %>%
+  summarise(n = n_distinct(sample_name))
+
+read_threshold <- 100
+
+df_long <- df_long %>%
+  filter(value >= read_threshold)
+
+
+ggplot(df_long, aes(x = species_name, y = value)) +
+  geom_boxplot(outlier.size = 0.5) +
+  coord_flip() +
+  geom_text(
+    data = count_data %>% filter(species_name %in% df_long$species_name),
+    aes(x = species_name, y = max(df_long$value, na.rm = TRUE) * 1.05, label = paste("n =", n)),
+    inherit.aes = FALSE,
+    size = 2.5,
+    hjust = -0.1
+  ) +
+  labs(
+    title = "Read Counts per Virus in unfiltered HIV Data using Pathonoia",
+    x = "Virus (species_name)",
+    y = "Read Count"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+

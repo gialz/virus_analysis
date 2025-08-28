@@ -1,0 +1,471 @@
+---
+title: "virtus_rimod"
+output: html_document
+date: "2025-07-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggpubr)
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(corrplot)
+library(ggcorrplot)
+library(pheatmap)
+library(RColorBrewer)
+library(palmerpenguins)
+library(ggthemes)
+library(forcats)
+
+```
+
+
+```{r loading virus summary data in, echo=FALSE}
+
+
+
+# Define the function to read and tag each file
+customized_read_tsv <- function(file) {
+  read_tsv(file, show_col_types = FALSE) %>%
+    mutate(fileName = basename(file),
+    sample = str_remove(fileName, "_VIRTUS.output.tsv$"))
+}
+
+# Apply the function to all .tsv files and process
+virtus_data <- list.files(path = "/Users/ginna/Desktop/internship/practice/virtus2/virtus_rimod_final/",
+           full.names = TRUE,
+           pattern = "\\.tsv$") %>%
+  lapply(customized_read_tsv) %>%
+  bind_rows() %>%
+  select(sample, virus, startpos, endpos, numreads, covbases, coverage,
+         meandepth, meanbaseq, meanmapq, rate_hit)
+
+
+virtus_data <- virtus_data %>%
+  mutate(
+    virus = if_else(
+      str_detect(virus, "\\|"),
+      str_extract(virus, "(?<=\\|)[^|]+$"),
+      virus
+    ),
+    virus = str_replace_all(virus, "_", " "),
+    virus = str_remove(virus, ", complete genome$"),
+    virus = str_remove(virus, ", genomic RNA, isolate Ib An 5550"),
+    virus = str_remove(virus, "NC [^ ]*?\\.(1|2)"),
+    virus = str_remove(virus, "^\\.([12])\\s*"),
+    virus = str_trim(virus)
+  )
+
+
+
+
+head(virtus_data, 10)
+```
+
+
+```{r loading rimod metadata in, echo=FALSE}
+rimod_data <- read.csv("/Users/ginna/Desktop/internship/practice/virtus2/new_rimod_meta_data_4.csv")
+```
+
+
+```{r left joining, echo=FALSE}
+all_data <- left_join(virtus_data,rimod_data)
+```
+
+
+```{r "Read Counts per Virus in VIRTUS RIMOD Data, echo=FALSE}
+
+virtus_data <- virtus_data %>%
+  mutate(virus = fct_reorder(virus, numreads, .fun=median))
+
+count_data <- virtus_data %>%
+  group_by(virus) %>%
+  summarise(n = n_distinct(sample)) %>%
+  mutate(virus = factor(virus, levels = levels(virtus_data$virus)))
+
+ggplot(virtus_data, aes(x = virus, y = numreads)) +
+  geom_boxplot() +
+  coord_flip() +
+  geom_text(
+    data = count_data,
+    aes(x = virus, y = max(virtus_data$numreads, na.rm = TRUE) * 1.05, label = paste("n =", n)),
+    inherit.aes = FALSE,
+    size = 2.5,
+    hjust = -0.1) +
+  labs(title = "Read Counts per Virus in RIMOD VIRTUS Data",
+      x = "Virus",
+      y = "Number of Reads") +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+
+```{r plotting box plot by genotype, echo=FALSE}
+
+ggplot(all_data, aes(x = virus, y = numreads, fill = genotype)) +
+  geom_boxplot() +
+  facet_wrap(~genotype) +
+  labs(title = "Read Counts per Virus in RIMOD Data by genotype (inc metadata)",
+       x = "Virus",
+       y = "Number of Reads") +
+    theme_minimal(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r plotting box plot by disease, echo=FALSE}
+
+ggplot(all_data, aes(x = virus, y = numreads, fill = disease)) +
+  geom_boxplot() +
+  labs(title = "Read Counts per Virus in RIMOD Data by disease",
+       x = "Virus",
+       y = "Number of Reads") +
+    theme_minimal(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r plotting heatmap by genotype, echo=FALSE}
+library(hrbrthemes)
+
+heatmap_data <- expand_grid(sample = unique(rimod_data$sample), virus = unique(all_data$virus)) %>% 
+  left_join(rimod_data %>% distinct(sample,genotype,disease)) %>%  
+  left_join(all_data)  %>% 
+  mutate(
+    meandepth = ifelse(is.na(meandepth),0,meandepth),
+    numreads = ifelse(is.na(numreads),0,numreads)
+  ) 
+
+summary_data <- heatmap_data %>% 
+  group_by(genotype, virus) %>% 
+  summarise(
+    mean_num_reads = mean(numreads, na.rm = TRUE),
+    n_samples = n(),
+    n_with_reads = sum(numreads > 0, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Order viruses by total reads or alphabetically
+summary_data <- summary_data %>%
+  mutate(virus = fct_reorder(virus, mean_num_reads, .fun = mean))
+
+
+summary_data %>%
+  ggplot(aes(x = virus, y = genotype, fill = mean_num_reads)) + 
+  geom_tile(color = 'white') +
+  scale_fill_gradient(low = "white", high = "blue", name = "Mean\nReads") +
+  labs(title = "Mean Read Counts per Virus by Genotype",
+       x = "Virus",
+       y = "Genotype") +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+```{r plotting heatmap by disease, echo=FALSE}
+library(hrbrthemes)
+
+ggplot(all_data, aes(x = virus, y = disease, fill = numreads)) + 
+  geom_tile(color = 'white') +
+  scale_fill_gradient(low="white", high="blue") +
+  labs(title = "Read Counts per Virus in ALL Data by disease",
+       x = "Virus",
+       y = "Number of Reads") +
+    theme_minimal(base_size = 7) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r burden score - virus correlation, echo=FALSE}
+here::here()
+#read in tables
+burden_table <- read.csv(file = "~/Desktop/internship/practice/virtus2/burden_score.csv", head = TRUE, sep=',')
+
+#join the tables
+virtus_burden <- heatmap_data %>%
+  left_join(burden_table, by = "sample")
+
+head(virtus_burden, 10)
+
+virus_correlations <- virtus_burden %>%
+  group_by(virus) %>%
+  summarise(
+    correlation = cor(numreads, burden_score, use = "complete.obs", method ="spearman"),
+    pvalue = cor.test(numreads, burden_score, use = "complete.obs", method ="spearman")$p.value,
+    n_samples = n_distinct(sample)
+  )%>%
+arrange(pvalue)
+
+top_virus <- virus_correlations %>% 
+  slice_min(pvalue) %>% 
+  pull(virus)
+
+scatter_data <- filter(virtus_burden, virus == top_virus)
+
+
+ggplot(scatter_data, aes(x=burden_score, y=numreads, colour = disease)) +
+  geom_point() +
+        labs(
+    title = "NumReads vs Burden Score",
+    x = "Burden Score",
+    y = "Number of Reads",
+    color = "Disease") +
+  theme_minimal()
+
+
+```
+
+
+```{r Viral Co-occurrence Network (Jaccard > 0.5), echo=FALSE}
+library(tidyverse)
+library(igraph)
+library(ggraph)
+
+# Example: Prepare presence/absence matrix
+# all_data is your combined dataset from earlier, with virus, sample, numreads
+
+presence_absence <- virtus_data %>%
+  mutate(present = ifelse(numreads > 0, 1, 0)) %>%
+  select(virus, sample, present) %>%
+  pivot_wider(names_from = sample, values_from = present, values_fill = 0) %>%
+  column_to_rownames("virus")
+
+# Calculate pairwise Jaccard similarity (using vegan package)
+library(vegan)
+jaccard_sim <- vegdist(t(presence_absence), method = "jaccard") # samples
+jaccard_sim_viruses <- vegdist(presence_absence, method = "jaccard") # viruses
+
+# Convert distance to similarity
+jaccard_sim_mat <- 1 - as.matrix(jaccard_sim_viruses)
+
+# Create graph from adjacency matrix (threshold edges at similarity > 0.5)
+adjacency <- jaccard_sim_mat
+adjacency[adjacency < 0.5] <- 0
+adjacency[adjacency >= 0.5] <- 1
+
+g <- graph_from_adjacency_matrix(adjacency, mode = "undirected", diag = FALSE)
+
+# Plot network with ggraph
+ggraph(g, layout = "fr") + 
+  geom_edge_link(alpha = 0.8) +
+  geom_node_point(size = 4, color = "steelblue") +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2) +
+  theme_void() +
+  ggtitle("Viral Co-occurrence Network (Jaccard > 0.5)")
+```
+
+```{r violin plot of viral abundance per virus by group, echo=FALSE}
+library(ggplot2)
+
+ggplot(heatmap_data, aes(x = virus, y = numreads, fill = disease)) +  # Map fill to group
+  geom_violin(trim = FALSE, alpha = 0.7, scale = "width", position = position_dodge(width = 0.9)) + 
+  scale_y_continuous(trans = scales::pseudo_log_trans()) +
+  coord_flip() +
+  theme(
+    axis.text.y = element_text(size = 4),
+    plot.margin = margin(t = 5, r = 0, b = 5, l = 0)  # Increase left margin (for virus labels)
+  ) +
+  labs(title = "Distribution of Viral Abundance per Virus by Group",
+       x = "Virus",
+       y = "log10(numreads + 1)",
+       fill = "Group")
+
+```
+
+```{r aggregating table, echo=FALSE}
+
+library(tidyverse)
+
+# Load data
+df <- read_csv("~/Desktop/internship/practice/virtus2/virtus_burden_table.csv")
+
+# Aggregate total viral reads per sample
+viral_summary <- df %>%
+  group_by(sample, disease) %>%
+  summarise(total_numreads = sum(numreads, na.rm = TRUE),
+            mean_burden_score = mean(burden_score, na.rm = TRUE))
+```
+
+```{r Plot distribution of total viral reads, echo=FALSE} 
+
+# Plot distribution of total viral reads
+ggplot(viral_summary, aes(x = total_numreads)) +
+  geom_histogram(binwidth = 10, fill = "turquoise", color = "black") +
+  labs(title = "Distribution of Total Viral Reads per Sample",
+       x = "Total Viral Reads",
+       y = "Number of Samples")
+
+```
+
+
+```{r aggregating table 2, echo=FALSE}
+library(tidyverse)
+
+
+# Aggregate total viral reads per sample by genotype
+viral_summary2 <- df %>%
+  group_by(sample, genotype.x) %>%
+  summarise(total_numreads = sum(numreads, na.rm = TRUE),
+            mean_burden_score = mean(burden_score, na.rm = TRUE))
+  .groups = 'drop'
+  
+  
+```
+
+
+```{r Plot distribution of total viral reads, echo=FALSE}
+
+ggplot(viral_summary2, aes(x = total_numreads)) +
+  geom_histogram(binwidth = 10, fill = "yellow", color = "black") +
+  labs(title = "Total Viral Reads per Sample",
+       x = "Total Viral Reads",
+       y = "Number of Samples")
+```
+
+
+```{r Boxplot comparing num of reads by disease group (FTD vs control), echo=FALSE}
+
+ggplot(viral_summary, aes(x = disease, y = total_numreads)) +
+  geom_boxplot(fill = "purple") +
+  labs(title = "Total Num of Reads by Disease Group",
+       x = "Disease Group",
+       y = "Total Viral Reads") +
+  theme_minimal() +
+  stat_compare_means()
+```
+
+```{r Boxplot comparing burden score by disease group (FTD vs control), echo=FALSE}
+
+ggplot(viral_summary, aes(x = disease, y = mean_burden_score)) +
+  geom_boxplot(fill = "purple") +
+  labs(title = "Total Num of Reads by Disease Group",
+       x = "Disease Group",
+       y = "Total Viral Reads") +
+  theme_minimal()
+```
+
+
+```{r Boxplot comparing num of reads by genotype, echo=FALSE}
+ggplot(viral_summary2, aes(x = genotype.x, y = total_numreads)) +
+  geom_boxplot(fill = "green") +
+  labs(title = "Total Num of Reads by genotype",
+       x = "Disease Group",
+       y = "Total Viral Reads") +
+  theme_minimal()
+```
+
+
+```{r Boxplot comparing burden score by genotype, echo=FALSE}
+
+ggplot(viral_summary2, aes(x = genotype.x, y = mean_burden_score)) +
+  geom_boxplot(fill = "green") +
+  labs(title = "Total Num of Reads by genotype",
+       x = "Disease Group",
+       y = "Total Viral Reads") +
+  theme_minimal()
+```
+
+
+```{r correlation matrix of virus, echo=FALSE}
+
+#rotate table
+virus_wide_reads <- virtus_burden %>%
+  select(sample, virus, numreads) %>%
+  pivot_wider(
+    names_from = virus,
+    values_from = numreads,
+    values_fill = 0
+  )
+
+#create a matrix and remove samples row
+coverage_matrix <- virus_wide_reads %>%
+  select(-sample) %>%
+  as.matrix()
+
+#calculate correlation  
+correlation_matrix <- cor(coverage_matrix, method = 'spearman', use = "complete.obs")
+cor.test(coverage_matrix, method = 'spearman', use = "complete.obs")
+
+corrplot(correlation_matrix, method = "color", order = "hclust", 
+         tl.cex = 0.3, tl.col = "black", main = "Correlation Matrix")
+         
+
+M = cor(coverage_matrix, method = 'spearman') 
+testRes = cor.mtest(coverage_matrix, conf.level = 0.95)
+cor <- corrplot(M, p.mat = testRes$p, sig.level = 0.10, insig = 'blank', order = 'hclust', addrect = 2, tl.cex = 0.3, tl.col = "black", )
+
+# Number of viruses to show
+n <- 5
+
+
+top_left_viruses <- rownames(M)[1:n]
+
+M_top_left <- M[top_left_viruses, top_left_viruses]
+p_top_left <- testRes$p[top_left_viruses, top_left_viruses]
+
+
+corrplot(M_top_left, p.mat = p_top_left, sig.level = 0.10, insig = 'blank',
+         order = 'original',  # keep original order, no clustering
+         tl.cex = 0.4, tl.col = "black",
+         main = paste("Top-left", n, "Viruses Correlation"))
+
+
+```
+
+
+```{r barchart showing Mean Read Counts per Virus by Genotype}
+
+
+count_data |>
+  filter(n > 2) |>
+  ggplot(aes(x = fct_reorder(virus, -n), y = n)) +
+  geom_col() +
+  labs(title = "Mean Read Counts per Virus by Genotype",
+       x = "Virus",
+       y = "N, number of occurences") +
+  theme_minimal(base_size = 5) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(virtus_burden, aes(x = virus, y = coverage)) +  # Map fill to group
+  geom_violin(trim = FALSE, alpha = 0.7, scale = "width", position = position_dodge(width = 0.9)) + 
+  coord_flip() +
+  theme(
+    axis.text.y = element_text(size = 4),
+    plot.margin = margin(t = 5, r = 0, b = 5, l = 0)  # Increase left margin (for virus labels)
+  ) +
+  labs(title = "Distribution of Coverage per Virus",
+       x = "Virus",
+       y = "Coverage",
+       )
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(virtus_burden, aes(x = virus, y = numreads)) + 
+  geom_violin(trim = FALSE, alpha = 0.7, scale = "width", position = position_dodge(width = 0.9)) + 
+  coord_flip() +
+  theme(
+    axis.text.y = element_text(size = 4),
+    plot.margin = margin(t = 5, r = 0, b = 5, l = 0)
+  ) +
+  labs(title = "Distribution of Num reads by Virus",
+       x = "Virus",
+       y = "Numreads",
+       )
+```
+
